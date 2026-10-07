@@ -19,7 +19,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="素材发行授权核验 API",
-    version="1.8.0",
+    version="1.9.0",
     description=(
         "登记素材与授权（地区/渠道/带时区左闭右开时段/可发行次数），"
         "对发行申请做整体核验、原子占用，支持查询、一次性撤销、"
@@ -33,7 +33,11 @@ app = FastAPI(
         "支持同一素材/地区/渠道下两条授权间的未占用次数转拨"
         "（操作号幂等，转拨后同事务重算候补）；"
         "并提供按授权编号追溯的不可改写额度账本（期初余额 + 逐笔流水，"
-        "游标键集翻页，首次查询固定上界，相邻页余额连续）。"
+        "游标键集翻页，首次查询固定上界，相邻页余额连续）；"
+        "以及运营额度巡检接口：同一数据库快照（REPEATABLE READ READ ONLY）"
+        "内三来源核对授权计数/未撤销发行明细/待确认预留明细（含已到期未"
+        "惰性结算者，仍按占额、巡检不结算）与期初及全部流水，逐笔校验"
+        "流水序号与前后余额衔接，差异只报告、不改写数据。"
     ),
     lifespan=lifespan,
 )
@@ -163,6 +167,23 @@ def get_authorization_ledger(
     return services.get_authorization_ledger_page(
         db, authorization_id, cursor=cursor, page_size=page_size
     )
+
+
+@app.get(
+    "/api/v1/authorizations/{authorization_id}/quota-audit",
+    response_model=schemas.AuthorizationQuotaAuditOut,
+    tags=["authorizations"],
+    summary=(
+        "运营巡检：在同一数据库快照（REPEATABLE READ READ ONLY）内核对授权"
+        "当前计数、未撤销发行明细、待确认预留明细（含已到期未惰性结算者，"
+        "仍按占额，巡检不触发结算）与期初/全部流水；逐笔校验流水序号与前后"
+        "余额衔接，三方比对占额与末值；只报告差异、不改写数据"
+    ),
+)
+def audit_authorization_quota(
+    authorization_id: int, db: Session = Depends(get_db)
+):
+    return services.audit_authorization_quota(db, authorization_id)
 
 
 # ------------------------------------------------------------------ 发行

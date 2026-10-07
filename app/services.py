@@ -2682,6 +2682,451 @@ def get_authorization_ledger_page(
     )
 
 
+# ========================================== 授权额度可追溯核对（运营巡检）
+# 巡检各检查项的固定顺序：首个异常（``first_anomaly``）即按此顺序取第一项
+# 未通过的检查，保证同一份数据多次巡检给出的首个异常稳定可复现。
+AUDIT_CHECKS = (
+    "opening_exists",
+    "ledger_sequence",
+    "ledger_chain",
+    "used_consistency",
+    "reserved_consistency",
+    "max_count_consistency",
+    "quota_invariant",
+)
+
+
+def audit_authorization_quota(db: Session, authorization_id: int) -> dict:
+    """运营巡检：在**同一数据库快照**内核验单条授权的额度是否仍可追溯。
+
+    快照口径
+    --------
+    使用独立连接开启 ``REPEATABLE READ READ ONLY`` 事务：授权当前计数、
+    未撤销发行明细、``pending`` 预留明细（含已到期但尚未惰性结算者——仍按
+    占额计算）、期初余额与**全部**流水均取自同一快照，并发发行 / 撤销 /
+    预留确认等写入事务的提交点不会混入同一次巡检结果。只读事务不获取
+    通道咨询锁、**不触发任何惰性结算与写入**（发现差异只报告、不改写）。
+
+    检查项（顺序见 :data:`AUDIT_CHECKS`）：
+      1. ``opening_exists``     期初余额行存在；
+      2. ``ledger_sequence``    流水序号自 1 起连续无缺号/重号；
+      3. ``ledger_chain``       逐笔前后余额衔接：首笔变化前 == 期初，
+                                其后每笔变化前 == 上一笔变化后；
+      4. ``used_consistency``   授权 ``used_count`` == 未撤销发行明细占额
+                                == 流水末值 used（无流水取期初）；
+      5. ``reserved_consistency`` 授权 ``reserved_count`` == 待确认预留
+                                明细占额（含已到期未结算者）== 流水末值
+                                reserved；
+      6. ``max_count_consistency`` 授权 ``max_count`` == 流水末值 max_count；
+      7. ``quota_invariant``    当前计数满足 used/reserved ≥ 0 且
+                                used + reserved ≤ max。
+
+    未知授权（授权行在快照中不存在）→ 404 ``not_found``。
+    """
+    # 独立会话/连接：与请求会话隔离，显式声明只读可重复读，杜绝混用不同
+    # 提交时刻的数据；连接归还连接池时由 rollback 结束事务。
+    snap = Session(
+        bind=db.get_bind(), autoflush=False, expire_on_commit=False
+    )
+    try:
+        # Session.connection() 发出 BEGIN；紧接 SET TRANSACTION 须为该事务
+        # 的第一条语句，随后全部 SELECT 共用同一快照。
+        snap.connection()
+        snap.execute(
+            text(
+                "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, "
+                "READ ONLY"
+            )
+        )
+
+        snapshot_at = snap.scalar(text("SELECT now()"))
+
+        auth = snap.get(models.Authorization, authorization_id)
+        if auth is None:
+            raise ResourceNotFound("授权", authorization_id)
+        material = snap.get(models.Material, auth.material_id)
+
+        # ---- 来源 1：授权当前三项计数
+        current = {
+            "used_count": auth.used_count,
+            "reserved_count": auth.reserved_count,
+            "max_count": auth.max_count,
+        }
+
+        # ---- 来源 2：未撤销（approved）发行明细逐笔占额
+        approved_rows = list(
+            snap.execute(
+                select(
+                    models.DistributionItem.id,
+                    models.DistributionItem.distribution_id,
+                    models.DistributionItem.material_id,
+                    models.DistributionItem.item_index,
+                    models.Distribution.occur_at,
+                )
+                .join(
+                    models.Distribution,
+                    models.Distribution.id
+                    == models.DistributionItem.distribution_id,
+                )
+                .where(
+                    models.DistributionItem.authorization_id
+                    == authorization_id,
+                    models.Distribution.status == "approved",
+                )
+                .order_by(models.DistributionItem.id.asc())
+            )
+        )
+        active_items = [
+            {
+                "distribution_item_id": row.id,
+                "distribution_id": row.distribution_id,
+                "material_id": row.material_id,
+                "item_index": row.item_index,
+                "occur_at": row.occur_at,
+            }
+            for row in approved_rows
+        ]
+
+        # ---- 来源 3：状态仍为 pending 的预留明细（逐项占预留额度）。
+        # 已到期但尚未被任一写事务惰性结算的 pending 预留仍按占额计算，
+        # 单独标记 expired_but_unsettled / due_unsettled_count 供运营定位；
+        # 巡检本身不结算它们。
+        pending_rows = list(
+            snap.execute(
+                select(
+                    models.ReservationItem.id,
+                    models.ReservationItem.reservation_id,
+                    models.ReservationItem.material_id,
+                    models.ReservationItem.item_index,
+                    models.Reservation.expires_at,
+                    models.Reservation.created_at,
+                )
+                .join(
+                    models.Reservation,
+                    models.Reservation.id
+                    == models.ReservationItem.reservation_id,
+                )
+                .where(
+                    models.ReservationItem.authorization_id
+                    == authorization_id,
+                    models.Reservation.status == "pending",
+                )
+                .order_by(models.ReservationItem.id.asc())
+            )
+        )
+        due_unsettled_count = 0
+        pending_items = []
+        for row in pending_rows:
+            expired_unsettled = row.expires_at <= snapshot_at
+            due_unsettled_count += 1 if expired_unsettled else 0
+            pending_items.append(
+                {
+                    "reservation_item_id": row.id,
+                    "reservation_id": row.reservation_id,
+                    "material_id": row.material_id,
+                    "item_index": row.item_index,
+                    "expires_at": row.expires_at,
+                    "created_at": row.created_at,
+                    "expired_but_unsettled": expired_unsettled,
+                }
+            )
+
+        # ---- 来源 4：期初余额与该授权的全部流水（同一快照）
+        opening = snap.scalar(
+            select(models.QuotaLedgerOpening).where(
+                models.QuotaLedgerOpening.authorization_id
+                == authorization_id
+            )
+        )
+        entries = list(
+            snap.scalars(
+                select(models.QuotaLedgerEntry)
+                .where(
+                    models.QuotaLedgerEntry.authorization_id
+                    == authorization_id
+                )
+                .order_by(models.QuotaLedgerEntry.entry_seq.asc())
+            )
+        )
+
+        opening_balance = (
+            {
+                "used_count": opening.used_count,
+                "reserved_count": opening.reserved_count,
+                "max_count": opening.max_count,
+            }
+            if opening is not None
+            else None
+        )
+        # 无流水时以期初为末值；期初亦缺失则账本侧无末值（单独报异常）。
+        if entries:
+            ending = {
+                "used_count": entries[-1].after_used_count,
+                "reserved_count": entries[-1].after_reserved_count,
+                "max_count": entries[-1].after_max_count,
+            }
+            last_entry_seq = entries[-1].entry_seq
+        elif opening is not None:
+            ending = dict(opening_balance)
+            last_entry_seq = 0
+        else:
+            ending = None
+            last_entry_seq = None
+
+        checks: list[dict] = []
+
+        def add_check(
+            name: str,
+            passed: bool | None,
+            *,
+            reason: str | None = None,
+            position: dict | None = None,
+            observed: dict | None = None,
+        ) -> None:
+            item: dict = {"check": name, "passed": passed}
+            if reason is not None:
+                item["reason"] = reason
+            if position is not None:
+                item["position"] = position
+            if observed is not None:
+                item["observed"] = observed
+            checks.append(item)
+
+        # 1) 期初存在
+        add_check(
+            "opening_exists",
+            opening is not None,
+            reason=(
+                None
+                if opening is not None
+                else "授权存在但额度账本期初余额行缺失，账本不完整"
+            ),
+            position=(
+                None
+                if opening is not None
+                else {
+                    "type": "quota_ledger_opening",
+                    "authorization_id": authorization_id,
+                }
+            ),
+        )
+
+        # 2) 流水序号：自 1 起严格连续（缺号 / 重号 / 非 1 起算均异常）
+        seq_passed = True
+        seq_reason = None
+        seq_position = None
+        for expected_seq, entry in enumerate(entries, start=1):
+            if entry.entry_seq != expected_seq:
+                seq_passed = False
+                seq_reason = (
+                    f"流水序号不连续：应为 {expected_seq}，"
+                    f"实际为 {entry.entry_seq}（存在缺号或重号）"
+                )
+                seq_position = {
+                    "type": "ledger_entry",
+                    "entry_seq": entry.entry_seq,
+                    "ledger_entry_id": entry.id,
+                    "expected_entry_seq": expected_seq,
+                }
+                break
+        add_check(
+            "ledger_sequence", seq_passed, reason=seq_reason,
+            position=seq_position,
+        )
+
+        # 3) 前后余额衔接：首笔 before == 期初；其后 before == 上一笔 after
+        chain_passed: bool | None = opening is not None
+        chain_reason = None
+        chain_position = None
+        chain_observed = None
+        if opening is None:
+            chain_reason = "期初余额缺失，无法校验前后余额衔接"
+        else:
+            prev = opening_balance
+            for entry in entries:
+                before = {
+                    "used_count": entry.before_used_count,
+                    "reserved_count": entry.before_reserved_count,
+                    "max_count": entry.before_max_count,
+                }
+                if before != prev:
+                    chain_passed = False
+                    chain_reason = (
+                        "流水前后余额不衔接：本笔变化前值"
+                        f" {before} 不等于上一笔期末（首笔为期初）{prev}"
+                    )
+                    chain_position = {
+                        "type": "ledger_entry",
+                        "entry_seq": entry.entry_seq,
+                        "ledger_entry_id": entry.id,
+                    }
+                    chain_observed = {
+                        "expected_before": prev,
+                        "actual_before": before,
+                    }
+                    break
+                prev = {
+                    "used_count": entry.after_used_count,
+                    "reserved_count": entry.after_reserved_count,
+                    "max_count": entry.after_max_count,
+                }
+        add_check(
+            "ledger_chain",
+            chain_passed,
+            reason=chain_reason,
+            position=chain_position,
+            observed=chain_observed,
+        )
+
+        # 4)/5)/6) 三来源数值比对
+        def add_consistency_check(
+            name: str,
+            counter: str,
+            detail_count: int | None,
+            *,
+            include_details: bool,
+        ) -> None:
+            ledger_value = ending[counter] if ending is not None else None
+            observed = {
+                "authorization": current[counter],
+                "details": detail_count,
+                "ledger_ending": ledger_value,
+            }
+            values = [current[counter]]
+            if include_details:
+                values.append(detail_count)
+            values.append(ledger_value)
+            passed = all(v is not None and v == values[0] for v in values)
+            if passed:
+                reason = None
+            elif ledger_value is None:
+                reason = (
+                    "账本侧缺少期末值（期初余额缺失），无法完成三方比对"
+                )
+            else:
+                parts = [
+                    f"授权当前计数={current[counter]}",
+                ]
+                if include_details:
+                    parts.append(f"明细占额={detail_count}")
+                parts.append(f"流水末值={ledger_value}")
+                reason = "额度数值不一致：" + "，".join(parts)
+            position = {"type": "authorization", "counter": counter}
+            add_check(
+                name, passed, reason=reason, position=position,
+                observed=observed,
+            )
+
+        add_consistency_check(
+            "used_consistency",
+            "used_count",
+            len(active_items),
+            include_details=True,
+        )
+        add_consistency_check(
+            "reserved_consistency",
+            "reserved_count",
+            len(pending_items),
+            include_details=True,
+        )
+        add_consistency_check(
+            "max_count_consistency",
+            "max_count",
+            None,
+            include_details=False,
+        )
+
+        # 7) 当前计数不变量
+        invariant_violations = []
+        if auth.used_count < 0:
+            invariant_violations.append("used_count < 0")
+        if auth.reserved_count < 0:
+            invariant_violations.append("reserved_count < 0")
+        if auth.used_count + auth.reserved_count > auth.max_count:
+            invariant_violations.append(
+                f"used_count + reserved_count "
+                f"({auth.used_count + auth.reserved_count}) > max_count "
+                f"({auth.max_count})"
+            )
+        add_check(
+            "quota_invariant",
+            not invariant_violations,
+            reason=(
+                None
+                if not invariant_violations
+                else "授权计数不变量被破坏：" + "；".join(invariant_violations)
+            ),
+            position={"type": "authorization", "authorization_id":
+                      authorization_id},
+            observed={
+                "used_count": auth.used_count,
+                "reserved_count": auth.reserved_count,
+                "max_count": auth.max_count,
+            },
+        )
+
+        first_anomaly = next(
+            (
+                {
+                    "check": item["check"],
+                    "reason": item.get("reason"),
+                    "position": item.get("position"),
+                    "observed": item.get("observed"),
+                }
+                for item in checks
+                if item["passed"] is False
+            ),
+            None,
+        )
+
+        return {
+            "authorization_id": authorization_id,
+            "material": (
+                {
+                    "material_id": material.id,
+                    "code": material.code,
+                    "name": material.name,
+                }
+                if material is not None
+                else {"material_id": auth.material_id}
+            ),
+            "region": auth.region,
+            "channel": auth.channel,
+            "status": auth.status,
+            "snapshot": {
+                "snapshot_at": snapshot_at,
+                "isolation_level": "REPEATABLE READ READ ONLY",
+                "settlement_triggered": False,
+            },
+            "sources": {
+                "authorization": current,
+                "active_distribution_items": {
+                    "count": len(active_items),
+                    "items": active_items,
+                },
+                "pending_reservation_items": {
+                    "count": len(pending_items),
+                    "due_unsettled_count": due_unsettled_count,
+                    "items": pending_items,
+                },
+                "ledger": {
+                    "opening_balance": opening_balance,
+                    "entry_count": len(entries),
+                    "last_entry_seq": last_entry_seq,
+                    "ending_balance": ending,
+                },
+            },
+            "checks": checks,
+            "consistent": first_anomaly is None,
+            "first_anomaly": first_anomaly,
+        }
+    except ResourceNotFound:
+        raise
+    finally:
+        snap.rollback()
+        snap.close()
+
+
 # ============================================================ 通道额度冻结
 def set_channel_freeze(
     db: Session, data: ChannelFreezeRequest

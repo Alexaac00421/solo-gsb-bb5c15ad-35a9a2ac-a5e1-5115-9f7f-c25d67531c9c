@@ -530,3 +530,124 @@ class AuthorizationLedgerOut(BaseModel):
         description="下一游标；null 表示该次翻页（首次查询固定上界内）已到末页",
     )
     page_size: int
+
+
+# ------------------------------------------------- 授权额度可追溯核对（巡检）
+class AuditMaterialRef(BaseModel):
+    material_id: int
+    code: str | None = None
+    name: str | None = None
+
+
+class AuditSnapshotInfo(BaseModel):
+    snapshot_at: datetime = Field(
+        description="巡检快照时刻（事务内 now()）；全部数据来源均取自该快照"
+    )
+    isolation_level: str = Field(
+        description="本次巡检事务隔离级别（REPEATABLE READ READ ONLY）"
+    )
+    settlement_triggered: bool = Field(
+        description="巡检是否触发了惰性结算（恒为 false：只读，不结算到期预留）"
+    )
+
+
+class AuditActiveDistributionItem(BaseModel):
+    distribution_item_id: int
+    distribution_id: int
+    material_id: int
+    item_index: int
+    occur_at: datetime
+
+
+class AuditPendingReservationItem(BaseModel):
+    reservation_item_id: int
+    reservation_id: int
+    material_id: int
+    item_index: int
+    expires_at: datetime
+    created_at: datetime
+    expired_but_unsettled: bool = Field(
+        description="快照时刻已到期但仍为 pending（尚未惰性结算）；仍按占额计算"
+    )
+
+
+class AuditCounterTriple(BaseModel):
+    used_count: int
+    reserved_count: int
+    max_count: int
+
+
+class AuditLedgerSource(BaseModel):
+    opening_balance: AuditCounterTriple | None = Field(
+        description="期初余额；null 表示期初行缺失（opening_exists 检查会报错）"
+    )
+    entry_count: int = Field(description="该授权快照内全部流水笔数")
+    last_entry_seq: int | None = Field(
+        description="最后一笔流水序号；无流水为 0，无期初且无流水为 null"
+    )
+    ending_balance: AuditCounterTriple | None = Field(
+        description="流水末值（最后一笔变化后值）；无流水时取期初；"
+        "期初亦缺失时为 null"
+    )
+
+
+class AuditSources(BaseModel):
+    authorization: AuditCounterTriple = Field(
+        description="来源 1：授权表当前三项计数"
+    )
+    active_distribution_items: dict = Field(
+        description="来源 2：未撤销（approved）发行明细占额（count + 逐项列表）"
+    )
+    pending_reservation_items: dict = Field(
+        description="来源 3：待确认（pending）预留明细占额（count + "
+        "due_unsettled_count + 逐项列表；含已到期未结算者）"
+    )
+    ledger: AuditLedgerSource = Field(description="来源 4：期初与全部流水")
+
+
+class AuditCheck(BaseModel):
+    check: str = Field(
+        description=(
+            "检查项：opening_exists / ledger_sequence / ledger_chain / "
+            "used_consistency / reserved_consistency / "
+            "max_count_consistency / quota_invariant"
+        )
+    )
+    passed: bool | None = Field(
+        description="是否通过；null 表示前置条件缺失而跳过（如期初缺失时的账本校验）"
+    )
+    reason: str | None = Field(default=None, description="未通过/跳过原因")
+    position: dict | None = Field(
+        default=None, description="异常定位（流水序号、业务明细编号、计数名等）"
+    )
+    observed: dict | None = Field(
+        default=None, description="检查时观察到的各来源实际数值"
+    )
+
+
+class AuditFirstAnomaly(BaseModel):
+    check: str = Field(description="首个异常的检查项（按固定检查顺序）")
+    reason: str | None = None
+    position: dict | None = Field(
+        default=None, description="首个异常位置（含 entry_seq/业务编号等）"
+    )
+    observed: dict | None = None
+
+
+class AuthorizationQuotaAuditOut(BaseModel):
+    authorization_id: int
+    material: AuditMaterialRef
+    region: str
+    channel: str
+    status: str
+    snapshot: AuditSnapshotInfo
+    sources: AuditSources
+    checks: list[AuditCheck] = Field(
+        description="全部检查项及各自结果（差异只报告，不改写任何数据）"
+    )
+    consistent: bool = Field(
+        description="全部检查是否均通过（true=额度可追溯且三来源一致）"
+    )
+    first_anomaly: AuditFirstAnomaly | None = Field(
+        default=None, description="首个异常的位置与原因；无异常为 null"
+    )

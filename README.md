@@ -84,6 +84,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `POST` | `/authorizations/migrate` | **授权退役：原授权未撤销申请一次性改挂到替代授权** |
 | `POST` | `/authorizations/transfer` | **授权间额度转拨：同一素材/地区/渠道下源授权未占用次数转拨到目标授权（操作号幂等）** |
 | `GET` | `/authorizations/{id}/ledger` | **按授权编号追溯额度账本：期初余额 + 不可改写逐笔流水（`?cursor=&page_size=` 游标翻页，首次查询固定上界，相邻页余额连续）** |
+| `GET` | `/authorizations/{id}/quota-audit` | **运营巡检：同一数据库快照（REPEATABLE READ READ ONLY）内三来源核对授权计数/未撤销发行明细/待确认预留明细与期初及全部流水，逐笔校验序号与余额衔接；只读、不触发结算、差异只报告不改写** |
 | `POST` | `/distributions` | **提交发行申请：整体核验并原子占用** |
 | `GET` | `/distributions/{id}` | 查询发行申请（含各项命中授权） |
 | `POST` | `/distributions/{id}/revoke` | **撤销申请（仅可一次），释放占用次数** |
@@ -434,6 +435,56 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
    `page_size` 不在 1～100 → 422 `invalid_page_size`（默认 20）。
 6. 账本查询为**只读**，不触发到期/候补惰性结算，原有业务接口的响应与
    行为保持兼容（仅新增本查询接口与服务端内部记账）。
+
+### 授权额度可追溯核对规则（运营巡检）
+
+运营按**授权编号**核对额度是否仍可追溯：
+`GET /api/v1/authorizations/{id}/quota-audit`。一次巡检在**同一数据库
+快照**内读取全部数据来源，并逐笔校验账本、三方比对计数，**只报告、不
+改写任何数据**：
+
+1. **同一快照**：巡检使用独立连接开启
+   ``REPEATABLE READ READ ONLY`` 事务（事务内 `now()` 为快照时刻），
+   下列四类数据全部取自该快照——并发发行 / 撤销 / 预留确认 / 转拨期间，
+   同一次巡检结果**不会混用不同提交时刻**的数据；各来源数值相互可比。
+2. **数据来源**（响应 `sources` 给出各来源数值与逐项明细）：
+   - `authorization`：授权表当前 `used_count` / `reserved_count` /
+     `max_count`；
+   - `active_distribution_items`：**未撤销**（申请 `status=approved`）
+     的发行明细逐项占额（每项 1 次），含申请编号 / 明细编号 / `item_index`；
+   - `pending_reservation_items`：**状态仍为 `pending`** 的预留明细逐项
+     占额，含预留编号 / `item_index` / `expires_at`；**已到期但尚未被
+     惰性结算的待确认预留仍按占额计算**，逐项标记
+     `expired_but_unsettled`，并汇总 `due_unsettled_count`；
+   - `ledger`：该授权的**期初余额**与**全部流水**（非分页，一次性读全）。
+3. **巡检不触发结算**：不获取通道咨询锁、不执行任何写语句；到期未结算
+   的 `pending` 预留保持原状（预留行与 `reserved_count` 都不变），仅在
+   报告中标记。`snapshot.settlement_triggered` 恒为 `false`。
+4. **逐笔流水校验**：
+   - `ledger_sequence`：`entry_seq` 自 1 起严格连续（缺号 / 重号即异常，
+     定位到实际序号与期望序号）；
+   - `ledger_chain`：**首笔变化前值 == 期初余额**，其后每笔变化前值
+     **== 上一笔变化后值**，异常处给出期望前值与实际前值。
+5. **三方比对**（响应 `checks[].observed` 给出各来源实际数值）：
+   - `used_consistency`：授权当前 `used_count` == 未撤销发行明细占额
+     == 流水末值 `used_count`；
+   - `reserved_consistency`：授权当前 `reserved_count` == 待确认预留
+     明细占额（含到期未结算）== 流水末值 `reserved_count`；
+   - `max_count_consistency`：授权当前 `max_count` == 流水末值
+     `max_count`（转拨只改 `max_count`，仍应与末值一致）；
+   - **没有流水时以期初为末值**；期初也缺失时账本侧末值为 `null`，
+     由 `opening_exists` 首先报错。
+   - 另含 `quota_invariant`：当前计数满足 `used/reserved ≥ 0` 且
+     `used + reserved ≤ max`。
+6. **结果**：`consistent` 为全部检查是否通过；`first_anomaly` 给出
+   **首个异常的检查项、位置与原因**（检查顺序固定：
+   期初存在 → 序号 → 余额衔接 → used → reserved → max_count → 不变量，
+   结果稳定可复现）；`checks` 为全部检查项的逐项结果。发现任何差异都
+   **只报告**，授权、明细、预留、流水均不被改写。
+7. **未知授权**（快照中授权行不存在）：**404 `not_found`**（注意与
+   「授权存在但期初行缺失」区分：后者返回 200 并由 `opening_exists`
+   检查报错）。巡检为纯只读 GET，原有发行、预留与账本接口的语义、
+   响应与启动方式均保持不变。
 
 ### 错误响应格式
 
@@ -1091,6 +1142,105 @@ curl -i "http://localhost:8000/api/v1/authorizations/1/ledger?page_size=0"
 | `migration_out` / `migration_in` | used 搬移 | `authorization_migration` | 改挂记录编号（两端共用同一编号） |
 | `transfer_out` / `transfer_in` | max_count 调整 | `quota_transfer` | 转拨记录编号（`detail` 另含操作号 `operation_no`） |
 
+### 授权额度巡检示例（curl）
+
+```bash
+# 对授权 1 做一次只读巡检（同一快照内三来源核对 + 逐笔校验）
+curl -s http://localhost:8000/api/v1/authorizations/1/quota-audit
+```
+
+一致时（无流水的授权以期初为末值；有发行 + 待确认预留时）：
+
+```json
+{
+  "authorization_id": 1,
+  "material": {"material_id": 1, "code": "m1", "name": "素材一"},
+  "region": "CN",
+  "channel": "web",
+  "status": "active",
+  "snapshot": {
+    "snapshot_at": "2026-10-07T08:30:00.000Z",
+    "isolation_level": "REPEATABLE READ READ ONLY",
+    "settlement_triggered": false
+  },
+  "sources": {
+    "authorization": {"used_count": 1, "reserved_count": 1, "max_count": 5},
+    "active_distribution_items": {
+      "count": 1,
+      "items": [
+        {"distribution_item_id": 1, "distribution_id": 1,
+         "material_id": 1, "item_index": 0,
+         "occur_at": "2026-12-01T04:00:00Z"}
+      ]
+    },
+    "pending_reservation_items": {
+      "count": 1,
+      "due_unsettled_count": 0,
+      "items": [
+        {"reservation_item_id": 1, "reservation_id": 1,
+         "material_id": 1, "item_index": 0,
+         "expires_at": "2026-10-07T08:50:00.000Z",
+         "created_at": "2026-10-07T08:20:00.000Z",
+         "expired_but_unsettled": false}
+      ]
+    },
+    "ledger": {
+      "opening_balance": {"used_count": 0, "reserved_count": 0, "max_count": 5},
+      "entry_count": 2,
+      "last_entry_seq": 2,
+      "ending_balance": {"used_count": 1, "reserved_count": 1, "max_count": 5}
+    }
+  },
+  "checks": [
+    {"check": "opening_exists", "passed": true,
+     "reason": null, "position": null, "observed": null},
+    {"check": "ledger_sequence", "passed": true,
+     "reason": null, "position": null, "observed": null},
+    {"check": "ledger_chain", "passed": true,
+     "reason": null, "position": null, "observed": null},
+    {"check": "used_consistency", "passed": true,
+     "observed": {"authorization": 1, "details": 1, "ledger_ending": 1},
+     "reason": null, "position": {"type": "authorization", "counter": "used_count"}},
+    {"check": "reserved_consistency", "passed": true,
+     "observed": {"authorization": 1, "details": 1, "ledger_ending": 1},
+     "reason": null, "position": {"type": "authorization", "counter": "reserved_count"}},
+    {"check": "max_count_consistency", "passed": true,
+     "observed": {"authorization": 5, "details": null, "ledger_ending": 5},
+     "reason": null, "position": {"type": "authorization", "counter": "max_count"}},
+    {"check": "quota_invariant", "passed": true,
+     "observed": {"used_count": 1, "reserved_count": 1, "max_count": 5},
+     "reason": null, "position": {"type": "authorization", "authorization_id": 1}}
+  ],
+  "consistent": true,
+  "first_anomaly": null
+}
+```
+
+```bash
+# 已到期但尚未惰性结算的待确认预留：仍计入 pending 明细占额（巡检不结算），
+# 逐项标记 expired_but_unsettled=true、due_unsettled_count 同步累加；
+# 授权 reserved_count 与该明细、流水末值仍两两相等 -> reserved_consistency 通过。
+
+# 发现差异时（示例：授权 used_count 与明细占额/流水末值不符）：
+# HTTP 200，consistent=false，first_anomaly 给出首个异常的位置与原因；
+# 数据保持原样，巡检不改写任何内容。
+# {
+#   "consistent": false,
+#   "first_anomaly": {
+#     "check": "used_consistency",
+#     "reason": "额度数值不一致：授权当前计数=2，明细占额=1，流水末值=1",
+#     "position": {"type": "authorization", "counter": "used_count"},
+#     "observed": {"authorization": 2, "details": 1, "ledger_ending": 1}
+#   }, ...
+# }
+# 流水缺号时首个异常为 ledger_sequence（position 给出实际/期望 entry_seq）；
+# 前后余额断裂时为 ledger_chain（observed 给出期望与实际变化前值）；
+# 授权存在但期初行缺失时为 opening_exists。
+
+# 未知授权 -> 404 not_found
+curl -i http://localhost:8000/api/v1/authorizations/9999/quota-audit
+```
+
 ---
 
 ## 5. 并发控制设计
@@ -1250,6 +1400,14 @@ curl -i "http://localhost:8000/api/v1/authorizations/1/ledger?page_size=0"
   page_size 越界 422、并发混合写后逐笔滚算与账实相符、流水表
   UPDATE/DELETE 触发器拦截，以及旧库升级回填期初（启用瞬间计数）的
   幂等迁移。
+- `tests/test_quota_audit.py`：53 项授权额度巡检端到端用例，覆盖无流水
+  以期初为末值、未知授权 404、发行+预留+撤销后三来源（授权计数/明细
+  占额/流水末值）一致、**已到期未惰性结算的 pending 预留仍按占额且
+  巡检不触发结算不改写状态**、授权计数被改账实不符（只报告不改写、
+  observed 给三值、首个异常定位）、流水缺号（序号异常定位）、前后余额
+  断裂（期望/实际变化前值）、期初行缺失（opening_exists 首先报错），
+  以及多线程并发发行/撤销期间多个巡检并发时同一次结果不混用提交时刻、
+  并发结束后账实仍一致。
 
 ```bash
 pip install -r requirements.txt httpx
@@ -1265,6 +1423,7 @@ python3 -m tests.test_waitlist
 python3 -m tests.test_channel_freeze
 python3 -m tests.test_transfer
 python3 -m tests.test_ledger
+python3 -m tests.test_quota_audit
 ```
 
 > 测试会先 `DROP` 再重建全部表，请勿指向含生产数据的数据库。
@@ -1294,7 +1453,8 @@ python3 -m tests.test_ledger
 │   │                  # 不透明游标编码校验/固定上界键集翻页
 │   └── services.py    # 核验占用 / 预留 / 确认 / 取消 / 到期结算 /
 │                      # 撤销 / 改期 / 改挂 / 候补受理与队列成交 /
-│                      # 通道冻结恢复 / 授权间额度转拨 / 账本查询（核心事务逻辑）
+│                      # 通道冻结恢复 / 授权间额度转拨 / 账本查询 /
+│                      # 授权额度巡检（REPEATABLE READ READ ONLY 同快照核对）
 └── tests/
     ├── test_api.py
     ├── test_migrate.py
@@ -1305,5 +1465,6 @@ python3 -m tests.test_ledger
     ├── test_channel_freeze.py
     ├── test_transfer.py
     ├── test_ledger.py
+    ├── test_quota_audit.py
     └── test_concurrency.py
 ```
