@@ -19,7 +19,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="素材发行授权核验 API",
-    version="1.8.0",
+    version="1.9.0",
     description=(
         "登记素材与授权（地区/渠道/带时区左闭右开时段/可发行次数），"
         "对发行申请做整体核验、原子占用，支持查询、一次性撤销、"
@@ -33,7 +33,10 @@ app = FastAPI(
         "支持同一素材/地区/渠道下两条授权间的未占用次数转拨"
         "（操作号幂等，转拨后同事务重算候补）；"
         "并提供按授权编号追溯的不可改写额度账本（期初余额 + 逐笔流水，"
-        "游标键集翻页，首次查询固定上界，相邻页余额连续）。"
+        "游标键集翻页，首次查询固定上界，相邻页余额连续），"
+        "以及按授权编号的额度巡检（同一 REPEATABLE READ 只读快照内核对"
+        "授权计数、未撤销发行明细、待确认预留明细与账本期初/全部流水，"
+        "逐笔检查序号与余额衔接，只报告不改写、不触发惰性结算）。"
     ),
     lifespan=lifespan,
 )
@@ -163,6 +166,24 @@ def get_authorization_ledger(
     return services.get_authorization_ledger_page(
         db, authorization_id, cursor=cursor, page_size=page_size
     )
+
+
+@app.get(
+    "/api/v1/authorizations/{authorization_id}/audit",
+    response_model=schemas.AuthorizationAuditOut,
+    tags=["authorizations"],
+    summary=(
+        "授权额度巡检：同一数据库快照（REPEATABLE READ 只读事务）内核对"
+        "授权计数、未撤销发行明细、待确认预留明细（含已到期未结算）与"
+        "账本期初/全部流水是否一致；逐笔检查序号与前后余额衔接，"
+        "报告各来源数值、是否一致及首个异常的位置和原因；"
+        "只报告不改写，不触发惰性结算"
+    ),
+)
+def audit_authorization(
+    authorization_id: int, db: Session = Depends(get_db)
+):
+    return services.audit_authorization_quota(db, authorization_id)
 
 
 # ------------------------------------------------------------------ 发行

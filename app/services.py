@@ -69,7 +69,7 @@ from sqlalchemy import select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
-from app import ledger, models
+from app import audit, ledger, models
 from app.errors import (
     AlreadyRevoked,
     ChannelFrozen,
@@ -2680,6 +2680,47 @@ def get_authorization_ledger_page(
     return ledger.get_authorization_ledger(
         db, authorization_id, cursor=cursor, page_size=page_size
     )
+
+
+# ================================================================ 额度巡检
+def audit_authorization_quota(
+    db: Session, authorization_id: int
+) -> dict:
+    """按授权编号核对额度是否仍可追溯（**只读对账，永不改写数据**）。
+
+    整个巡检在单个事务的**同一快照**（REPEATABLE READ + READ ONLY）内
+    读取：授权当前计数、未撤销发行明细、库内仍为 ``pending`` 的预留明细
+    （**含已到期但尚未惰性结算者，仍按占额计入，巡检不触发结算**）以及
+    期初余额与全部流水。并发发行/撤销/预留确认期间，一次巡检的结果只可能
+    全部来自巡检开始前或之后的某个完整提交时刻，不会混用。
+
+    - 未知授权 → 404 ``not_found``；
+    - 只读事务以 **ROLLBACK** 结束（即使一切正常也不提交），巡检自身
+      绝不写入，也不触发任何到期预留/候补的惰性结算。
+    """
+    try:
+        # SET TRANSACTION 必须是事务的第一条语句：在尚未执行任何查询的
+        # 新会话上先设置隔离级别与只读（PostgreSQL 允许二者同句声明），
+        # 随后所有 SELECT 共用该 REPEATABLE READ 事务的同一个快照。
+        db.execute(
+            text(
+                "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"
+            )
+        )
+        snapshot = audit.load_audit_snapshot(db, authorization_id)
+        if snapshot.authorization is None:
+            # 未知授权明确报错（404）；只读事务回滚，无任何副作用。
+            db.rollback()
+            raise ResourceNotFound("授权", authorization_id)
+        result = audit.reconcile(snapshot)
+        # 巡检只报告、不改写：全部读数完成后以回滚结束只读事务。
+        db.rollback()
+    except ResourceNotFound:
+        raise
+    except Exception:
+        db.rollback()
+        raise
+    return result
 
 
 # ============================================================ 通道额度冻结

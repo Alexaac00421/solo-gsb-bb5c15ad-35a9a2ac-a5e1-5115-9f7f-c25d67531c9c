@@ -530,3 +530,144 @@ class AuthorizationLedgerOut(BaseModel):
         description="下一游标；null 表示该次翻页（首次查询固定上界内）已到末页",
     )
     page_size: int
+
+
+# ------------------------------------------------------------- 额度巡检
+class QuotaAuditEntryOut(BaseModel):
+    """巡检快照内的一笔流水（前后余额完整快照）。"""
+
+    entry_seq: int
+    event_type: str
+    ref_type: str
+    ref_id: str
+    counterparty_authorization_id: int | None = None
+    before_balance: QuotaLedgerBalance
+    after_balance: QuotaLedgerBalance
+    occurred_at: datetime
+
+
+class QuotaAuditDistributionItemOut(BaseModel):
+    """未撤销发行明细的对账引用（distribution.status=approved）。"""
+
+    distribution_item_id: int
+    distribution_id: int
+    item_index: int
+    material_id: int
+    occur_at: datetime
+    created_at: datetime
+
+
+class QuotaAuditReservationItemOut(BaseModel):
+    """待确认预留明细的对账引用（reservation.status=pending）。"""
+
+    reservation_item_id: int
+    reservation_id: int
+    item_index: int
+    material_id: int
+    expires_at: datetime
+    created_at: datetime
+    settlement_due: bool = Field(
+        description=(
+            "已到期（expires_at <= 巡检快照时刻）但库内仍为 pending、"
+            "尚未惰性结算；巡检不触发结算，该明细仍按占额计入"
+        )
+    )
+
+
+class QuotaAuditLedgerOut(BaseModel):
+    entry_count: int
+    first_entry_seq: int | None
+    last_entry_seq: int | None
+    tail_balance: QuotaLedgerBalance | None = Field(
+        default=None, description="流水末值（最后一笔变化后值）；无流水时取期初"
+    )
+    entries: list[QuotaAuditEntryOut]
+
+
+class QuotaAuditDistributionItemsOut(BaseModel):
+    count: int
+    items: list[QuotaAuditDistributionItemOut]
+
+
+class QuotaAuditReservationItemsOut(BaseModel):
+    count: int
+    expired_unsettled_count: int = Field(
+        description="其中已到期但尚未惰性结算的明细数（仍按占额计入 count）"
+    )
+    items: list[QuotaAuditReservationItemOut]
+
+
+class QuotaAuditSourcesOut(BaseModel):
+    """同一数据库快照下四个来源的数值与明细。"""
+
+    authorization_counts: QuotaLedgerBalance = Field(
+        description="来源①：授权当前计数 used/reserved/max"
+    )
+    opening_balance: QuotaLedgerBalance | None = Field(
+        default=None, description="来源④-期初：额度账本期初余额（缺失为 null）"
+    )
+    ledger: QuotaAuditLedgerOut = Field(
+        description="来源④：期初与全部流水（末值 = 末笔 after，无流水=期初）"
+    )
+    active_distribution_items: QuotaAuditDistributionItemsOut = Field(
+        description="来源②：未撤销发行明细及其占额合计"
+    )
+    pending_reservation_items: QuotaAuditReservationItemsOut = Field(
+        description="来源③：待确认预留明细（含已到期未惰性结算）及其占额合计"
+    )
+
+
+class QuotaAuditCheckOut(BaseModel):
+    """单项检查结果；ok=false 时携带原因、位置与期望/实际值。"""
+
+    model_config = ConfigDict(extra="allow")
+
+    name: str
+    ok: bool
+    reason: str | None = None
+    message: str | None = None
+    location: dict | None = None
+    expected: object | None = None
+    actual: object | None = None
+
+
+class QuotaAuditFirstAnomalyOut(BaseModel):
+    """按固定检查顺序定位到的首个异常（全部一致时为 null）。"""
+
+    check: str
+    reason: str
+    message: str
+    location: dict | None = None
+    expected: object | None = None
+    actual: object | None = None
+
+
+class QuotaAuditSnapshotOut(BaseModel):
+    isolation_level: str
+    read_only: bool
+    transaction_id: str = Field(
+        description="巡检事务 id（pg_current_xact_id）；佐证全部读数出自同一事务/同一快照"
+    )
+
+
+class AuthorizationAuditOut(BaseModel):
+    """授权额度巡检结果：各来源数值、逐项检查、是否一致与首个异常。"""
+
+    authorization_id: int
+    checked_at: datetime = Field(
+        description="巡检快照时刻（事务内 now()）；到期未结算判定以此为准"
+    )
+    snapshot: QuotaAuditSnapshotOut
+    consistent: bool = Field(
+        description="全部检查通过为 true；false 时只报告差异、不改写任何数据"
+    )
+    sources: QuotaAuditSourcesOut
+    checks: list[QuotaAuditCheckOut] = Field(
+        description=(
+            "按固定顺序执行的全部检查：ledger_opening / ledger_entry_seq / "
+            "ledger_balance_chain / ledger_counter_invariant / "
+            "used_details_vs_counter / reserved_details_vs_counter / "
+            "ledger_tail_used/reserved/max_vs_counter"
+        )
+    )
+    first_anomaly: QuotaAuditFirstAnomalyOut | None = None

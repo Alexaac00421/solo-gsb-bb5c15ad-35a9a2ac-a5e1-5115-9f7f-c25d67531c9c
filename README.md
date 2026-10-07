@@ -1,6 +1,6 @@
 # 素材发行授权核验 HTTP API
 
-为内容团队构建的素材发行授权核验服务：登记素材及其发行授权（**地区、渠道、带时区的左闭右开时段、可发行次数**），对携带多个素材的发行申请做**整体核验、原子占用**，支持已通过申请的查询、**一次性撤销（释放占用）**、**改期（更换发行时刻并原子重选授权）**、授权退役时的**一次性改挂**，支持发行前的**额度预留**（1～30 分钟有效期，待确认/确认/取消/过期全生命周期），以及额度不足时的**通道候补队列**（候补可设 **1～1440 分钟申请有效期**，按受理顺序成交/失败/取消/**到期失效**，新直接申请不抢候补额度）；支持发行团队**按地区 + 渠道临时冻结 / 恢复新额度发放**（冻结须填原因；冻结期拒绝一切新占额，既有操作不受影响且释放额度不成交候补；恢复时先按原受理顺序清理仍有效候补再放行新请求）；并支持运营在**同一素材/地区/渠道的两条授权间转拨未占用次数**（操作号幂等：同号同参重放返回首次结果、异参冲突；先结算到期预留并按原顺序处理候补上再判定可转出量，成功后同事务重算候补）。
+为内容团队构建的素材发行授权核验服务：登记素材及其发行授权（**地区、渠道、带时区的左闭右开时段、可发行次数**），对携带多个素材的发行申请做**整体核验、原子占用**，支持已通过申请的查询、**一次性撤销（释放占用）**、**改期（更换发行时刻并原子重选授权）**、授权退役时的**一次性改挂**，支持发行前的**额度预留**（1～30 分钟有效期，待确认/确认/取消/过期全生命周期），以及额度不足时的**通道候补队列**（候补可设 **1～1440 分钟申请有效期**，按受理顺序成交/失败/取消/**到期失效**，新直接申请不抢候补额度）；支持发行团队**按地区 + 渠道临时冻结 / 恢复新额度发放**（冻结须填原因；冻结期拒绝一切新占额，既有操作不受影响且释放额度不成交候补；恢复时先按原受理顺序清理仍有效候补再放行新请求）；支持运营在**同一素材/地区/渠道的两条授权间转拨未占用次数**（操作号幂等：同号同参重放返回首次结果、异参冲突；先结算到期预留并按原顺序处理候补上再判定可转出量，成功后同事务重算候补）；并支持运营**按授权编号做额度巡检（只读对账）**：在同一数据库快照（REPEATABLE READ 只读事务）内读取授权计数、未撤销发行明细、待确认预留明细（**已到期未惰性结算者仍按占额计入且巡检不触发结算**）与账本期初/全部流水，逐笔检查序号与前后余额衔接，分别比较明细占额、流水末值与当前计数，返回各来源数值、是否一致及首个异常的位置和原因（只报告、不改写）。
 
 - 技术栈：Python 3.11 · FastAPI · SQLAlchemy 2 · PostgreSQL 16 · Pydantic v2
 - 并发安全：数据库行锁 + 通道咨询锁 + 条件更新三重保障，**高并发下绝不超额、不重复释放、候补不重复成交、转拨不重复执行**
@@ -84,6 +84,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `POST` | `/authorizations/migrate` | **授权退役：原授权未撤销申请一次性改挂到替代授权** |
 | `POST` | `/authorizations/transfer` | **授权间额度转拨：同一素材/地区/渠道下源授权未占用次数转拨到目标授权（操作号幂等）** |
 | `GET` | `/authorizations/{id}/ledger` | **按授权编号追溯额度账本：期初余额 + 不可改写逐笔流水（`?cursor=&page_size=` 游标翻页，首次查询固定上界，相邻页余额连续）** |
+| `GET` | `/authorizations/{id}/audit` | **授权额度巡检：同一数据库快照（REPEATABLE READ 只读事务）内核对授权计数、未撤销发行明细、待确认预留明细（含已到期未结算）与账本期初/全部流水，逐笔检查序号与余额衔接，只报告不改写、不触发结算** |
 | `POST` | `/distributions` | **提交发行申请：整体核验并原子占用** |
 | `GET` | `/distributions/{id}` | 查询发行申请（含各项命中授权） |
 | `POST` | `/distributions/{id}/revoke` | **撤销申请（仅可一次），释放占用次数** |
@@ -435,6 +436,57 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 6. 账本查询为**只读**，不触发到期/候补惰性结算，原有业务接口的响应与
    行为保持兼容（仅新增本查询接口与服务端内部记账）。
 
+### 授权额度巡检规则（按授权编号核对可追溯性）
+
+运营需要按授权编号核对额度是否仍可追溯时，调用
+`GET /api/v1/authorizations/{id}/audit`。巡检是**只读对账**：在单个
+**REPEATABLE READ READ ONLY** 数据库事务内完成全部读取——该事务的每条
+SELECT 共用**同一个快照**，因此同一次巡检的结果只可能全部来自巡检开始前
+或巡检之后的某个完整提交时刻；并发发行 / 撤销 / 预留确认 / 转拨在巡检
+期间的提交**不会混入**本次结果。巡检事务以 **ROLLBACK** 结束，**绝不写入、
+不改写任何数据，也不触发任何到期预留 / 候补的惰性结算**。
+
+同一快照内读取四个来源并给出各自数值：
+
+1. **授权当前计数**：`used_count` / `reserved_count` / `max_count`；
+2. **未撤销发行明细**：归属该授权且申请状态为 `approved` 的逐项明细，
+   其条数即正式占用占额（已撤销明细不计入）；
+3. **状态仍为待确认（`pending`）的预留明细**：库内状态即判定依据，
+   **已到期（`expires_at <= 巡检时刻`）但尚未惰性结算的预留仍按占额
+   计入**，逐项以 `settlement_due=true` 标记，并汇总
+   `expired_unsettled_count`；巡检不结算这些预留；
+4. **期初余额与全部逐笔流水**：该授权的 `quota_ledger_openings` 期初行
+   与全部 `quota_ledger_entries`（`entry_seq` 升序）。
+
+巡检按以下**固定顺序**逐项检查，并定位**首个异常**的位置与原因
+（`checks` 中仍列出全部检查项及各自是否通过；`first_anomaly` 为按顺序
+遇到的第一项失败）：
+
+| 顺序 | 检查名 | 异常 reason | 检查内容 |
+| --- | --- | --- | --- |
+| 1 | `ledger_opening` | `opening_balance_missing` | 期初余额行必须存在 |
+| 2 | `ledger_entry_seq` | `entry_seq_gap` | 流水序号自 1 起严格连续（1,2,3,…） |
+| 3 | `ledger_balance_chain` | `balance_chain_broken` | 首笔 `before` == 期初；其后每笔 `before` == 上一笔 `after` |
+| 4 | `ledger_counter_invariant` | `counter_invariant_violated` | 每笔 `after` 满足 used≥0、reserved≥0、used+reserved≤max |
+| 5 | `used_details_vs_counter` | `used_count_mismatch` | 未撤销发行明细条数 == 当前 `used_count` |
+| 6 | `reserved_details_vs_counter` | `reserved_count_mismatch` | 待确认预留明细条数（含到期未结算）== 当前 `reserved_count` |
+| 7 | `ledger_tail_used_vs_counter` | `used_count_mismatch` | 流水末值 used（无流水=期初）== 当前 `used_count` |
+| 8 | `ledger_tail_reserved_vs_counter` | `reserved_count_mismatch` | 流水末值 reserved（无流水=期初）== 当前 `reserved_count` |
+| 9 | `ledger_tail_max_vs_counter` | `max_count_mismatch` | 流水末值 max（无流水=期初）== 当前 `max_count` |
+
+约定：
+
+- **没有流水时以 期初余额 为末值**；期初行也缺失时（异常库）期初/末值为
+  `null`，首个异常为 `ledger_opening`。
+- 响应顶层 `consistent` 为全部检查是否一致；发现差异**只报告**
+  （给出 `expected`/`actual` 与 `location`：来源、流水序号、事件类型、
+  关联业务编号 `ref_type`/`ref_id`、明细编号等），**不改写任何数据**。
+- `snapshot` 回传 `isolation_level`（`repeatable read`）、`read_only=true`
+  与巡检事务 id（`pg_current_xact_id`）及快照时刻 `checked_at`，用于佐证
+  全部读数出自同一事务/同一快照。
+- 未知授权编号 → **404 `not_found`**（明确报错；巡检事务回滚，无副作用）。
+- 原有发行、预留与账本接口语义保持不变（巡检是新增只读接口）。
+
 ### 错误响应格式
 
 所有业务错误统一为：
@@ -485,7 +537,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | 409 | `quota_transfer_conflict` | 相同操作号携带不同参数（源/目标/次数任一不同）的转拨请求 |
 | 422 | `invalid_ledger_cursor` | 额度账本游标不可解析、版本不符或不属于该授权编号 |
 | 422 | `invalid_page_size` | 额度账本 `page_size` 不在 1～100（默认 20） |
-| 404 | `not_found` | 路径中的素材/授权/申请/预留/候补编号不存在（改挂时原/替代授权任一不存在；转拨时源/目标授权任一不存在） |
+| 404 | `not_found` | 路径中的素材/授权/申请/预留/候补编号不存在（改挂时原/替代授权任一不存在；转拨时源/目标授权任一不存在；**巡检授权编号不存在**） |
 
 `distribution_rejected` / `reschedule_rejected` / `reservation_rejected`
 / `waitlist_rejected` 的逐项原因 `reason`：
@@ -1076,6 +1128,127 @@ curl -i "http://localhost:8000/api/v1/authorizations/1/ledger?cursor=garbage"
 curl -i "http://localhost:8000/api/v1/authorizations/1/ledger?page_size=0"
 ```
 
+### 授权额度巡检操作示例（curl）
+
+```bash
+# 33) 按授权编号巡检：同一 REPEATABLE READ 只读快照内对账
+curl -s http://localhost:8000/api/v1/authorizations/1/audit
+```
+
+```json
+{
+  "authorization_id": 1,
+  "checked_at": "2026-10-07T03:10:00.000Z",
+  "snapshot": {
+    "isolation_level": "repeatable read",
+    "read_only": true,
+    "transaction_id": "812345"
+  },
+  "consistent": true,
+  "sources": {
+    "authorization_counts": {"used_count": 2, "reserved_count": 1, "max_count": 5},
+    "opening_balance": {"used_count": 0, "reserved_count": 0, "max_count": 5},
+    "ledger": {
+      "entry_count": 3,
+      "first_entry_seq": 1,
+      "last_entry_seq": 3,
+      "tail_balance": {"used_count": 2, "reserved_count": 1, "max_count": 5},
+      "entries": [
+        {"entry_seq": 1, "event_type": "direct_distribution",
+         "ref_type": "distribution", "ref_id": "1",
+         "counterparty_authorization_id": null,
+         "before_balance": {"used_count": 0, "reserved_count": 0, "max_count": 5},
+         "after_balance":  {"used_count": 1, "reserved_count": 0, "max_count": 5},
+         "occurred_at": "2026-10-07T03:00:01Z"},
+        {"entry_seq": 2, "event_type": "direct_distribution",
+         "ref_type": "distribution", "ref_id": "2",
+         "counterparty_authorization_id": null,
+         "before_balance": {"used_count": 1, "reserved_count": 0, "max_count": 5},
+         "after_balance":  {"used_count": 2, "reserved_count": 0, "max_count": 5},
+         "occurred_at": "2026-10-07T03:00:02Z"},
+        {"entry_seq": 3, "event_type": "reservation_placed",
+         "ref_type": "reservation", "ref_id": "1",
+         "counterparty_authorization_id": null,
+         "before_balance": {"used_count": 2, "reserved_count": 0, "max_count": 5},
+         "after_balance":  {"used_count": 2, "reserved_count": 1, "max_count": 5},
+         "occurred_at": "2026-10-07T03:00:03Z"}
+      ]
+    },
+    "active_distribution_items": {
+      "count": 2,
+      "items": [
+        {"distribution_item_id": 1, "distribution_id": 1, "item_index": 0,
+         "material_id": 1, "occur_at": "2026-12-01T12:00:00+08:00",
+         "created_at": "2026-10-07T03:00:01Z"},
+        {"distribution_item_id": 2, "distribution_id": 2, "item_index": 0,
+         "material_id": 1, "occur_at": "2026-12-01T12:00:00+08:00",
+         "created_at": "2026-10-07T03:00:02Z"}
+      ]
+    },
+    "pending_reservation_items": {
+      "count": 1,
+      "expired_unsettled_count": 0,
+      "items": [
+        {"reservation_item_id": 1, "reservation_id": 1, "item_index": 0,
+         "material_id": 1, "expires_at": "2026-10-07T03:15:03Z",
+         "created_at": "2026-10-07T03:00:03Z", "settlement_due": false}
+      ]
+    }
+  },
+  "checks": [
+    {"name": "ledger_opening", "ok": true},
+    {"name": "ledger_entry_seq", "ok": true},
+    {"name": "ledger_balance_chain", "ok": true},
+    {"name": "ledger_counter_invariant", "ok": true},
+    {"name": "used_details_vs_counter", "ok": true,
+     "detail_count": 2, "counter_value": 2},
+    {"name": "reserved_details_vs_counter", "ok": true,
+     "detail_count": 1, "counter_value": 1, "expired_unsettled_count": 0},
+    {"name": "ledger_tail_used_vs_counter", "ok": true,
+     "counter_value": 2, "tail_value": 2},
+    {"name": "ledger_tail_reserved_vs_counter", "ok": true,
+     "counter_value": 1, "tail_value": 1},
+    {"name": "ledger_tail_max_vs_counter", "ok": true,
+     "counter_value": 5, "tail_value": 5}
+  ],
+  "first_anomaly": null
+}
+```
+
+```bash
+# 待确认预留即使已到期但尚未被业务接口/写事务惰性结算，巡检仍按占额
+# 计入（settlement_due=true，expired_unsettled_count 计入），且不触发结算：
+curl -s http://localhost:8000/api/v1/authorizations/1/audit | jq '.sources.pending_reservation_items'
+# {"count": 1, "expired_unsettled_count": 1,
+#  "items": [{"reservation_id": 1, ..., "settlement_due": true}]}
+
+# 发现差异：consistent=false，first_anomaly 给出首个异常的检查项、原因、
+# 位置与期望/实际值（只报告，不改写数据）；checks 同时列出全部检查结果。
+curl -s http://localhost:8000/api/v1/authorizations/1/audit | jq '{consistent, first_anomaly}'
+# {"consistent": false,
+#  "first_anomaly": {
+#    "check": "used_details_vs_counter",
+#    "reason": "used_count_mismatch",
+#    "message": "未撤销发行明细占额与授权当前 used_count 不一致",
+#    "location": {"source": "distribution_items",
+#                 "condition": "distribution.status = 'approved'",
+#                 "authorization_id": 1},
+#    "expected": 2, "actual": 1}}
+
+# 流水序号缺口时，首个异常定位到具体流水（event_type/ref_type/ref_id）：
+# {"check": "ledger_entry_seq", "reason": "entry_seq_gap",
+#  "location": {"entry_seq": 3, "event_type": "...", "ref_type": "...",
+#               "ref_id": "...", "occurred_at": "..."},
+#  "expected": 2, "actual": 3}
+
+# 未知授权 -> 404 not_found
+curl -i http://localhost:8000/api/v1/authorizations/9999/audit
+```
+
+> 巡检为只读（REPEATABLE READ READ ONLY，事务回滚结束），不会改变
+> 预留/候补状态与任何计数；同一巡检响应中的授权计数、明细与流水全部
+> 取自同一快照（`snapshot.transaction_id` 为该巡检事务 id）。
+
 事件类型（`event_type`）与关联业务编号（`ref_type`/`ref_id`）：
 
 | event_type | 计数变化 | ref_type | ref_id 含义 |
@@ -1250,6 +1423,15 @@ curl -i "http://localhost:8000/api/v1/authorizations/1/ledger?page_size=0"
   page_size 越界 422、并发混合写后逐笔滚算与账实相符、流水表
   UPDATE/DELETE 触发器拦截，以及旧库升级回填期初（启用瞬间计数）的
   幂等迁移。
+- `tests/test_audit.py`：授权额度巡检端到端用例，覆盖空授权（无流水
+  末值=期初）、发行/撤销/预留/多素材混合后四来源数值一致与全量账实
+  相符、流水序号连续与逐笔前后余额衔接、**已到期但尚未惰性结算的
+  pending 预留仍按占额计入（`settlement_due`/`expired_unsettled_count`）
+  且巡检不触发结算（库内仍 pending、计数不变）**、连续巡检无副作用、
+  人为制造计数/流水差异后 `consistent=false` 且 `first_anomaly` 按固定
+  检查顺序定位（来源、位置、期望/实际值）、**只读快照不混入并发提交**
+  （REPEATABLE READ 事务内连接并发写不可见）、巡检只报告不改写、
+  未知授权 404。
 
 ```bash
 pip install -r requirements.txt httpx
@@ -1265,6 +1447,7 @@ python3 -m tests.test_waitlist
 python3 -m tests.test_channel_freeze
 python3 -m tests.test_transfer
 python3 -m tests.test_ledger
+python3 -m tests.test_audit
 ```
 
 > 测试会先 `DROP` 再重建全部表，请勿指向含生产数据的数据库。
@@ -1292,9 +1475,13 @@ python3 -m tests.test_ledger
 │   │                  # 账本 invalid_ledger_cursor/invalid_page_size）
 │   ├── ledger.py      # 额度账本：期初/条件计数推进 RETURNING/逐笔流水追加/
 │   │                  # 不透明游标编码校验/固定上界键集翻页
+│   ├── audit.py       # 额度巡检：REPEATABLE READ 只读快照内读取四来源
+│   │                  # （当前计数/未撤销发行明细/待确认预留明细/期初+全部流水）
+│   │                  # 并逐笔核对序号、余额衔接、明细占额与流水末值（只报告）
 │   └── services.py    # 核验占用 / 预留 / 确认 / 取消 / 到期结算 /
 │                      # 撤销 / 改期 / 改挂 / 候补受理与队列成交 /
-│                      # 通道冻结恢复 / 授权间额度转拨 / 账本查询（核心事务逻辑）
+│                      # 通道冻结恢复 / 授权间额度转拨 / 账本查询 /
+│                      # 额度巡检（核心事务逻辑）
 └── tests/
     ├── test_api.py
     ├── test_migrate.py
@@ -1305,5 +1492,6 @@ python3 -m tests.test_ledger
     ├── test_channel_freeze.py
     ├── test_transfer.py
     ├── test_ledger.py
+    ├── test_audit.py
     └── test_concurrency.py
 ```
